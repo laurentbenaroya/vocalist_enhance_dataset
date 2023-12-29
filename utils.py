@@ -42,7 +42,29 @@ def set_parameters(model):
     print([name for name, p in model.named_parameters() if p.requires_grad])
     print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
     return params
-import pdb
+
+
+def set_parameters_multiclass(model, n_classes, device):
+    # multiclass
+    model.classifier_n = torch.nn.Linear(model.d_model, n_classes).to(device)
+    # set trainable parameters
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.mem_transformer.parameters():
+        p.requires_grad = False
+    for p in model.vid_prenet.parameters():
+        p.requires_grad = False
+    for p in model.aud_prenet.parameters():
+        p.requires_grad = False
+    for p in model.fc.parameters():
+        p.requires_grad = True
+    for p in model.classifier_n.parameters():
+        p.requires_grad = True
+    params = [p for p in model.parameters() if p.requires_grad]
+    print([name for name, p in model.named_parameters() if p.requires_grad])
+    print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+    return params
+
 
 def calc_pdist(model, img, mels, vshift=15, device='cpu'):
     win_size = vshift * 2 + 1
