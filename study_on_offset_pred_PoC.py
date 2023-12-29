@@ -50,28 +50,22 @@ BATCH_SIZE = 1
 n_classes = 8
 n_max = n_classes*4
 n_samples = 25
+delta_audio = 10  # frames offset
 
-def trainit(device, model, train_data_loader, val_data_loader, optimizer, checkpoint_dir, checkpoint_interval, nepochs):
 
-    batch_size = 20  # arbitrary ?
+def trainit(device, model, train_data_loader, val_data_loader, optimizer, 
+            checkpoint_dir, checkpoint_interval, n_epochs=10):
+
     audio_fps = 16000/hparams.hop_size  # float, 80.
     video_fps = hparams.fps  # 25.
     mel_step_size = int(v_context / video_fps * audio_fps)-1  # 16
-    # samplewise_acc_k5 = []
     loss_fct = torch.nn.CrossEntropyLoss()
     model.train()
 
-    # n_step_percent = 0.4
-    # n_valid_percent = 1.
-    # total_step = len(train_data_loader)
-    # n_step = int(total_step*n_step_percent)
-    # n_valid_step = int(total_step*n_valid_percent)
+    onehot_targets = torch.nn.functional.one_hot(torch.tensor([0, 1, 2]), num_classes=n_classes).float().squeeze(0).to(
+        device)
+    loss_weights = [1.0, 0.95, 0.93]
 
-    onehot_target0 = torch.nn.functional.one_hot(torch.tensor([0]), num_classes=n_classes).float().squeeze(0).to(device)
-    onehot_target1 = torch.nn.functional.one_hot(torch.tensor([1]), num_classes=n_classes).float().squeeze(0).to(device)
-    onehot_target2 = torch.nn.functional.one_hot(torch.tensor([2]), num_classes=n_classes).float().squeeze(0).to(device)
-
-    n_epochs = 10
     for epoch in range(n_epochs):
         print('] EPOCH %d [' % epoch)
         total_loss = 0.0
@@ -82,18 +76,18 @@ def trainit(device, model, train_data_loader, val_data_loader, optimizer, checkp
 
             optimizer.zero_grad()
 
-            lastframe = lastframe.item()
-            vid = vid.view(1, lastframe, 3, 48, 96)
+            # lastframe = lastframe.item()
+            vid = vid.view(1, -1, 3, 48, 96)
             # print('vid size ', vid.size())  # torch.Size([1, 325, 3, 48, 96])
             # print('aud size ', aud.size())  # torch.Size([1, 1074, 1, 80])
-            delta = 10
+            
             # take context along dimension 1 and batch the windows
             aud_batch = [aud[:, i: i + int(n_samples*audio_fps/video_fps), :, :]
-                         for i in [int(item+delta) for item in np.linspace(0, n_max, n_classes)]]
+                         for i in [int(item+delta_audio) for item in np.linspace(0, n_max, n_classes)]]
             audio_batch = torch.cat(aud_batch, 0).permute(0, 2, 3, 1).to(device)
             B = audio_batch.size(0)
             #
-            img_batch = vid[:, delta:delta+n_samples, :, :, :].view(1, -1, 48, 96).repeat(B, 1, 1, 1).to(device)
+            img_batch = vid[:, delta_audio:delta_audio+n_samples, :, :, :].view(1, -1, 48, 96).repeat(B, 1, 1, 1).to(device)
 
             # print()
             # print(f'img_batch size {img_batch.size()}')
@@ -102,11 +96,9 @@ def trainit(device, model, train_data_loader, val_data_loader, optimizer, checkp
             raw_sync_scores = model(img_batch, audio_batch)
             # print('raw_sync_scores.size() ', raw_sync_scores.size())
             # print(torch.nn.functional.softmax(raw_sync_scores, 0))
-            loss0 = loss_fct(raw_sync_scores, onehot_target0)
-            loss1 = loss_fct(raw_sync_scores, onehot_target1)
-            loss2 = loss_fct(raw_sync_scores, onehot_target2)
-
-            loss = loss0 + 0.95*loss1 + 0.93*loss2
+            loss = torch.tensor([0.], device=device)
+            for v, w in enumerate(loss_weights):
+                loss += w*loss_fct(raw_sync_scores, onehot_targets[v])
             # print('loss = ', loss)
 
             loss.backward()
@@ -115,7 +107,8 @@ def trainit(device, model, train_data_loader, val_data_loader, optimizer, checkp
             preds = torch.argmax(raw_sync_scores).item()
             # print(torch.nn.functional.softmax(raw_sync_scores))
             # print(preds.item())
-            total_corrects += np.sum(preds==0)+np.sum(preds==1)+np.sum(preds==2)
+            for v in range(len(loss_weights)):
+                total_corrects += np.sum(preds == v)
             total_sum += 1
             preds_list.append(preds)
             # Add these lines to obtain f1_score
@@ -128,19 +121,16 @@ def trainit(device, model, train_data_loader, val_data_loader, optimizer, checkp
         # , f1 score: {f1_score_out*100.:.1f}')
 
         # if step % n_valid_step == 0:
-        valid(device, model, val_data_loader)
+        valid(device, model, val_data_loader, onehot_targets, loss_weights, delta_audio)
 
-def valid(device, model, val_data_loader):
+
+def valid(device, model, val_data_loader, onehot_targets, loss_weights, delta_audio):
 
     audio_fps = 16000/hparams.hop_size  # float, 80.
     video_fps = hparams.fps  # 25.
     mel_step_size = int(v_context / video_fps * audio_fps)-1  # 16
     loss_fct = torch.nn.CrossEntropyLoss()
     model.eval()
-
-    onehot_target0 = torch.nn.functional.one_hot(torch.tensor([0]), num_classes=n_classes).float().squeeze(0).to(device)
-    onehot_target1 = torch.nn.functional.one_hot(torch.tensor([1]), num_classes=n_classes).float().squeeze(0).to(device)
-    onehot_target2 = torch.nn.functional.one_hot(torch.tensor([2]), num_classes=n_classes).float().squeeze(0).to(device)
 
     total_loss = 0.0
     preds_list = []
@@ -153,36 +143,33 @@ def valid(device, model, val_data_loader):
             # print('vid size ', vid.size())  # torch.Size([1, 325, 3, 48, 96])
             # print('aud size ', aud.size())  # torch.Size([1, 1074, 1, 80])
 
-            lastframe = lastframe.item()
+            # lastframe = lastframe.item()
             vid = vid.view(1, -1, 3, 48, 96)
 
             # take context along dimension 1 and batch the windows
-            delta = 10
-            # take context along dimension 1 and batch the windows
             aud_batch = [aud[:, i: i + int(n_samples*audio_fps/video_fps), :, :]
-                         for i in [int(item+delta) for item in np.linspace(0, n_max, n_classes)]]
+                         for i in [int(item+delta_audio) for item in np.linspace(0, n_max, n_classes)]]
             audio_batch = torch.cat(aud_batch, 0).permute(0, 2, 3, 1).to(device)
             B = audio_batch.size(0)
             #
-            img_batch = vid[:, delta:delta+n_samples, :, :, :].view(1, -1, 48, 96).repeat(B, 1, 1, 1).to(device)
+            img_batch = vid[:, delta_audio:delta_audio+n_samples, :, :, :].view(1, -1, 48, 96).repeat(B, 1, 1, 1).to(device)
 
             # im_batch = [vid[:, i: i + n_samples, :, :, :].view(1, -1, 48, 96)
-            #             for i in [int(item+delta) for item in np.linspace(0, n_max, n_classes)]]
+            #             for i in [int(item+delta_audio) for item in np.linspace(0, n_max, n_classes)]]
             # img_batch = torch.cat(im_batch, 0).to(device)
             # B = img_batch.size(0)
             # audio_batch = aud[:, :int(n_samples*audio_fps/video_fps), :, :].repeat(B, 1, 1, 1).permute(0, 2, 3, 1).to(device)
 
             raw_sync_scores = model(img_batch, audio_batch)
-            loss0 = loss_fct(raw_sync_scores, onehot_target0)
-            loss1 = loss_fct(raw_sync_scores, onehot_target1)
-            loss2 = loss_fct(raw_sync_scores, onehot_target2)
-
-            loss = loss0 + 0.95*loss1 + 0.93*loss2
+            loss = torch.tensor([0.], device=device)
+            for v, w in enumerate(loss_weights):
+                loss += w * loss_fct(raw_sync_scores, onehot_targets[v])
 
         preds = torch.argmax(raw_sync_scores).item()
         preds_list.append(preds)
 
-        total_corrects += np.sum(preds == 0) + np.sum(preds == 1) + np.sum(preds == 2)
+        for v in range(len(loss_weights)):
+            total_corrects += np.sum(preds == v)
         total_elts += 1
         total_loss += loss.item()
 
@@ -225,4 +212,4 @@ if __name__ == "__main__":
         global_epoch = 0
 
     trainit(device, model, train_data_loader, val_data_loader, optimizer, checkpoint_dir=checkpoint_dir,
-          checkpoint_interval=10, nepochs=650)
+            checkpoint_interval=10, n_epochs=650)
