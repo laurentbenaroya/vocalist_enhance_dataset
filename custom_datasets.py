@@ -134,3 +134,8 @@ class Dataset(object):
         assert mels is not None
 
         return vid, mels, lastframe
+
+
+def collate_fn(batch):
+    a, b, c = zip(*batch)
+    return a, b, c
