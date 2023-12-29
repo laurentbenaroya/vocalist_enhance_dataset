@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-
+import soundfile as sf
 
 def _load(checkpoint_path, use_cuda=False):
     if use_cuda:
@@ -26,6 +26,22 @@ def load_checkpoint(path, model, optimizer, reset_optimizer=False, use_cuda=Fals
     global_epoch = checkpoint["global_epoch"]
 
     return
+
+
+def set_parameters(model):
+    # set trainable parameters
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.mem_transformer.parameters():
+        p.requires_grad = True
+    for p in model.fc.parameters():
+        p.requires_grad = True
+    for p in model.classifier.parameters():
+        p.requires_grad = True
+    params = [p for p in model.parameters() if p.requires_grad]
+    print([name for name, p in model.named_parameters() if p.requires_grad])
+    print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+    return params
 import pdb
 
 def calc_pdist(model, img, mels, vshift=15, device='cpu'):
@@ -63,6 +79,19 @@ def calc_pdist(model, img, mels, vshift=15, device='cpu'):
 
     return dists
 
+
+def get_audio_duration_with_soundfile(audio_file_path):
+    with sf.SoundFile(audio_file_path, 'r') as audio_file:
+        # Get the number of frames in the audio file
+        num_frames = len(audio_file)
+
+        # Get the frame rate of the audio file
+        frame_rate = audio_file.samplerate
+
+        # Calculate the duration in seconds
+        duration = float(num_frames) / frame_rate
+
+        return duration
 
 def force_cudnn_initialization():
     s = 32

@@ -6,22 +6,22 @@ from tqdm import tqdm
 from models.model import SyncTransformer
 from sklearn.metrics import f1_score
 import torch
-from torch import nn
 from torch import optim
 from torch.utils import data as data_utils
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-from torchaudio.transforms import MelScale
 from glob import glob
 import os, random, cv2, argparse
-from hparams_gtx3070 import hparams, get_image_list
+from hparams_gtx3070 import hparams
+import pdb
 import sys
-from natsort import natsorted
 import soundfile as sf
 import torch.multiprocessing
+from sklearn.metrics import f1_score
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-from utils import load_checkpoint, calc_pdist, force_cudnn_initialization
+from utils import load_checkpoint, force_cudnn_initialization, set_parameters
+from custom_datasets import Dataset as MyDataset
 
 """
 training based on sync error
@@ -40,186 +40,160 @@ global_epoch = 0
 use_cuda = torch.cuda.is_available()
 print('use_cuda: {}'.format(use_cuda))
 
-# RuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED using pytorch
+# little trick avoid RuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED using pytorch
 # solution,
 # https://stackoverflow.com/questions/66588715/runtimeerror-cudnn-error-cudnn-status-not-initialized-using-pytorch
 force_cudnn_initialization()
 
-num_audio_elements = 3200  # 6400  # 16000/25 * syncnet_T
-tot_num_frames = 25  # buffer
 v_context = 5
 BATCH_SIZE = 1
-TOP_DB = -hparams.min_level_db
-MIN_LEVEL = np.exp(TOP_DB / -20 * np.log(10))
-# melscale = MelScale(n_mels=hparams.num_mels, sample_rate=hparams.sample_rate, f_min=hparams.fmin, f_max=hparams.fmax,
-#                     n_stft=hparams.n_stft, norm='slaney', mel_scale='slaney').to(0)
-logloss = nn.BCEWithLogitsLoss()
+n_classes = 8
+n_max = n_classes*4
+n_samples = 25
 
-import pdb
-def makeit(device, model, test_data_loader, optimizer, checkpoint_dir, checkpoint_interval, nepochs):
+def trainit(device, model, train_data_loader, val_data_loader, optimizer, checkpoint_dir, checkpoint_interval, nepochs):
 
     batch_size = 20  # arbitrary ?
     audio_fps = 16000/hparams.hop_size  # float, 80.
     video_fps = hparams.fps  # 25.
     mel_step_size = int(v_context / video_fps * audio_fps)-1  # 16
     # samplewise_acc_k5 = []
-    prog_bar = enumerate(test_data_loader)
-    for step, (vid, aud, lastframe) in prog_bar:
-        model.eval()
-        with torch.no_grad():
+    loss_fct = torch.nn.CrossEntropyLoss()
+    model.train()
+
+    # n_step_percent = 0.4
+    # n_valid_percent = 1.
+    # total_step = len(train_data_loader)
+    # n_step = int(total_step*n_step_percent)
+    # n_valid_step = int(total_step*n_valid_percent)
+
+    onehot_target0 = torch.nn.functional.one_hot(torch.tensor([0]), num_classes=n_classes).float().squeeze(0).to(device)
+    onehot_target1 = torch.nn.functional.one_hot(torch.tensor([1]), num_classes=n_classes).float().squeeze(0).to(device)
+    onehot_target2 = torch.nn.functional.one_hot(torch.tensor([2]), num_classes=n_classes).float().squeeze(0).to(device)
+
+    n_epochs = 10
+    for epoch in range(n_epochs):
+        print('] EPOCH %d [' % epoch)
+        total_loss = 0.0
+        total_corrects = 0
+        total_sum = 0
+        preds_list = []
+        for step, (vid, aud, lastframe) in tqdm(enumerate(train_data_loader), total=len(train_data_loader)):
+
+            optimizer.zero_grad()
+
             lastframe = lastframe.item()
             vid = vid.view(1, lastframe, 3, 48, 96)
-            print('vid size ', vid.size())  # torch.Size([1, 325, 3, 48, 96])
-            print('aud size ', aud.size())  # torch.Size([1, 1074, 1, 80])
+            # print('vid size ', vid.size())  # torch.Size([1, 325, 3, 48, 96])
+            # print('aud size ', aud.size())  # torch.Size([1, 1074, 1, 80])
+            delta = 10
+            # take context along dimension 1 and batch the windows
+            aud_batch = [aud[:, i: i + int(n_samples*audio_fps/video_fps), :, :]
+                         for i in [int(item+delta) for item in np.linspace(0, n_max, n_classes)]]
+            audio_batch = torch.cat(aud_batch, 0).permute(0, 2, 3, 1).to(device)
+            B = audio_batch.size(0)
+            #
+            img_batch = vid[:, delta:delta+n_samples, :, :, :].view(1, -1, 48, 96).repeat(B, 1, 1, 1).to(device)
+
+            # print()
+            # print(f'img_batch size {img_batch.size()}')
+            # print(f'audio_batch size {audio_batch.size()}')
+            # print('calc loss')
+            raw_sync_scores = model(img_batch, audio_batch)
+            # print('raw_sync_scores.size() ', raw_sync_scores.size())
+            # print(torch.nn.functional.softmax(raw_sync_scores, 0))
+            loss0 = loss_fct(raw_sync_scores, onehot_target0)
+            loss1 = loss_fct(raw_sync_scores, onehot_target1)
+            loss2 = loss_fct(raw_sync_scores, onehot_target2)
+
+            loss = loss0 + 0.95*loss1 + 0.93*loss2
+            # print('loss = ', loss)
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            preds = torch.argmax(raw_sync_scores).item()
+            # print(torch.nn.functional.softmax(raw_sync_scores))
+            # print(preds.item())
+            total_corrects += np.sum(preds==0)+np.sum(preds==1)+np.sum(preds==2)
+            total_sum += 1
+            preds_list.append(preds)
+            # Add these lines to obtain f1_score
+
+        # if step % n_step == 0:    # print
+        preds_np = np.array(preds_list)
+        f1_score_out = f1_score(np.zeros_like(preds_np), preds_np, average='micro')
+        # print(f1_score_out)
+        print(f'[TRAIN], loss: {total_loss / total_sum:.3f}, acc: {total_corrects/ total_sum*100.:.1f}')
+        # , f1 score: {f1_score_out*100.:.1f}')
+
+        # if step % n_valid_step == 0:
+        valid(device, model, val_data_loader)
+
+def valid(device, model, val_data_loader):
+
+    audio_fps = 16000/hparams.hop_size  # float, 80.
+    video_fps = hparams.fps  # 25.
+    mel_step_size = int(v_context / video_fps * audio_fps)-1  # 16
+    loss_fct = torch.nn.CrossEntropyLoss()
+    model.eval()
+
+    onehot_target0 = torch.nn.functional.one_hot(torch.tensor([0]), num_classes=n_classes).float().squeeze(0).to(device)
+    onehot_target1 = torch.nn.functional.one_hot(torch.tensor([1]), num_classes=n_classes).float().squeeze(0).to(device)
+    onehot_target2 = torch.nn.functional.one_hot(torch.tensor([2]), num_classes=n_classes).float().squeeze(0).to(device)
+
+    total_loss = 0.0
+    preds_list = []
+    total_corrects = 0
+    total_elts = 0
+    # n_max_step = len(val_data_loader)//4-1
+    for step, (vid, aud, lastframe) in tqdm(enumerate(val_data_loader), total=len(val_data_loader)):
+        with torch.no_grad():
+
+            # print('vid size ', vid.size())  # torch.Size([1, 325, 3, 48, 96])
+            # print('aud size ', aud.size())  # torch.Size([1, 1074, 1, 80])
+
+            lastframe = lastframe.item()
+            vid = vid.view(1, -1, 3, 48, 96)
 
             # take context along dimension 1 and batch the windows
-            im_batch = [vid[:, i: i + lastframe//3, :, :, :].view(1, -1, 48, 96)
-                        for i in range(0, 100, 5)]
-            img_batch = torch.cat(im_batch, 0).to(device)
-            B = img_batch.size(0)
-            audio_batch = aud[:, :int(lastframe//3*audio_fps/video_fps), :, :].repeat(B, 1, 1, 1).permute(0, 2, 3, 1).to(device)
+            delta = 10
+            # take context along dimension 1 and batch the windows
+            aud_batch = [aud[:, i: i + int(n_samples*audio_fps/video_fps), :, :]
+                         for i in [int(item+delta) for item in np.linspace(0, n_max, n_classes)]]
+            audio_batch = torch.cat(aud_batch, 0).permute(0, 2, 3, 1).to(device)
+            B = audio_batch.size(0)
+            #
+            img_batch = vid[:, delta:delta+n_samples, :, :, :].view(1, -1, 48, 96).repeat(B, 1, 1, 1).to(device)
 
-            print()
-            print(f'img_batch size {img_batch.size()}')
-            print(f'audio_batch size {audio_batch.size()}')
-            print('calc pdist')
+            # im_batch = [vid[:, i: i + n_samples, :, :, :].view(1, -1, 48, 96)
+            #             for i in [int(item+delta) for item in np.linspace(0, n_max, n_classes)]]
+            # img_batch = torch.cat(im_batch, 0).to(device)
+            # B = img_batch.size(0)
+            # audio_batch = aud[:, :int(n_samples*audio_fps/video_fps), :, :].repeat(B, 1, 1, 1).permute(0, 2, 3, 1).to(device)
+
             raw_sync_scores = model(img_batch, audio_batch)
-            print(raw_sync_scores.size())
-            print(torch.nn.functional.softmax(raw_sync_scores, 0))
+            loss0 = loss_fct(raw_sync_scores, onehot_target0)
+            loss1 = loss_fct(raw_sync_scores, onehot_target1)
+            loss2 = loss_fct(raw_sync_scores, onehot_target2)
 
-def get_audio_duration_with_soundfile(audio_file_path):
-    with sf.SoundFile(audio_file_path, 'r') as audio_file:
-        # Get the number of frames in the audio file
-        num_frames = len(audio_file)
+            loss = loss0 + 0.95*loss1 + 0.93*loss2
 
-        # Get the frame rate of the audio file
-        frame_rate = audio_file.samplerate
+        preds = torch.argmax(raw_sync_scores).item()
+        preds_list.append(preds)
 
-        # Calculate the duration in seconds
-        duration = float(num_frames) / frame_rate
+        total_corrects += np.sum(preds == 0) + np.sum(preds == 1) + np.sum(preds == 2)
+        total_elts += 1
+        total_loss += loss.item()
 
-        return duration
+        # if step == n_max_step:
+        #     break
 
+    preds_np = np.array(preds_list)
+    f1_score_out = f1_score(np.zeros_like(preds_np), preds_np, average='micro')
 
-class DatasetTest(object):
-    """
-    dataset class used for testing, which we will use also for training, on a limited number of videos
-    """
-    def __init__(self, split='test', overwrite=False, device=None):
-
-        self.split = split
-        self.all_videos = get_image_list('', split)
-        # self.all_videos = [item.strip() for item in self.all_videos]
-        self.datalen = len(self.all_videos)
-
-        # precompute mels
-        print('precompute mels')  # not really helpful
-        for idx in tqdm(range(self.datalen)):
-            vidname = self.all_videos[idx]  # dirname(self.all_videos[idx])
-            melpath = join(vidname, "mel.pt")
-            wavpath = join(vidname, "audio.wav")
-            if not os.path.isfile(melpath) or overwrite:
-                melscale = MelScale(n_mels=hparams.num_mels, sample_rate=hparams.sample_rate, f_min=hparams.fmin,
-                                    f_max=hparams.fmax,
-                                    n_stft=hparams.n_stft, norm='slaney', mel_scale='slaney').to(device)
-                wav = self.get_wav(wavpath)
-                aud_tensor = torch.FloatTensor(wav).to(device)
-                spec = torch.stft(aud_tensor, n_fft=hparams.n_fft, hop_length=hparams.hop_size,
-                                  win_length=hparams.win_size,
-                                  window=torch.hann_window(hparams.win_size), return_complex=True)
-                melspec = melscale(torch.abs(spec.detach().clone()).float())
-                melspec_tr1 = (20 * torch.log10(torch.clamp(melspec, min=MIN_LEVEL))) - hparams.ref_level_db
-                # NORMALIZED MEL
-                normalized_mel = torch.clip(
-                    (2 * hparams.max_abs_value) * ((melspec_tr1 + TOP_DB) / TOP_DB) - hparams.max_abs_value,
-                    -hparams.max_abs_value, hparams.max_abs_value)
-                mels = normalized_mel.unsqueeze(0).permute(2, 0, 1).cpu()
-                torch.save(mels, melpath)
-
-    def get_frame_id(self, frame):
-        return int(basename(frame).split('.')[0])
-
-    def get_wav(self, wavpath):
-        return sf.read(wavpath)[0]
-
-    def get_window(self, img_name, len_img_names):
-        """
-        get all frames after (inclusive) img_name id
-        :param img_name:
-        :param len_img_names:
-        :return: frame list
-        """
-        start_frame_id = self.get_frame_id(img_name)
-        vidname = dirname(img_name)
-
-        window_fnames = []
-        for frame_id in range(start_frame_id, len_img_names):
-            frame = join(vidname, '{}.jpg'.format(frame_id))
-            if not isfile(frame):
-                print(f'{vidname, "{}.jpg".format(frame_id)} is not a file')
-                return None
-            window_fnames.append(frame)
-        return window_fnames
-
-    def __len__(self):
-        return 1  # len(self.all_videos)  # *10
-
-    def __getitem__(self, idx):
-
-        # idx = 0
-        # idx = idx%len(self.all_videos)
-        vidname = self.all_videos[idx]
-        print(vidname)
-        wavpath = join(vidname, "audio.wav")
-        melpath = join(vidname, "mel.pt")
-        mels = torch.load(melpath)
-        img_names = natsorted(list(glob(join(vidname, '*.jpg'))), key=lambda y: y.lower())
-
-        # all this to try avoiding the -1
-        # get img_names a list len multiple of fps (25)
-        # the problem came from '1.jpg' instead of str(np.min(img_nums)) + '.jpg' (0.jpg here)
-        len_img_names = len(img_names) - len(img_names) % 25
-        img_names = img_names[:len_img_names]
-        img_nums = [int(basename(item)[:-4]) for item in img_names]
-
-        # take floor of sound duration in sec
-        num_video_frames = min(len(img_names), np.floor(get_audio_duration_with_soundfile(wavpath)) * 25)
-        lastframe = num_video_frames  # -1
-
-        img_name = os.path.join(vidname, str(np.min(img_nums)) + '.jpg')
-        window_fnames = self.get_window(img_name, len(img_names))
-        assert window_fnames is not None
-
-        window = []
-        all_read = True
-        for fname in window_fnames:
-            img = cv2.imread(fname)
-            if img is None:
-                all_read = False
-                break
-            try:
-                img = cv2.resize(img, (hparams.img_size, hparams.img_size))
-            except Exception as e:
-                all_read = False
-                break
-
-            window.append(img)
-
-        assert all_read, 'not all frames where read...'
-
-        # H, W, T, 3 --> T*3
-        vid = np.concatenate(window, axis=2) / 255.
-        vid = vid.transpose(2, 0, 1)
-        # take the lower part of the image NOT EXPLICITLY THE LIPS (48 = img_size/2)
-        vid = torch.FloatTensor(vid[:, 48:])
-
-        assert not torch.any(torch.isnan(vid))
-        assert not torch.any(torch.isnan(mels))
-
-        assert vid is not None
-        assert mels is not None
-
-        return vid, mels, lastframe
+    print(f'[VALIDATION], loss: {total_loss / total_elts:.3f},'
+          f' acc: {total_corrects/ total_elts*100.:.1f}')  # , f1 score: {f1_score_out*100.:.1f}')
 
 
 if __name__ == "__main__":
@@ -230,31 +204,25 @@ if __name__ == "__main__":
     # Dataset and Dataloader setup
     print('Dataset and Dataloader setup')
     device = torch.device("cuda" if use_cuda else "cpu")
-    test_dataset = DatasetTest('test', overwrite=True, device='cpu')
+    train_dataset = MyDataset('test', overwrite=True, device='cpu')  # use test set !!!!!!
+    val_dataset = MyDataset('val', overwrite=True, device='cpu')
 
     print('Data loader setup')
-    test_data_loader = data_utils.DataLoader(test_dataset, batch_size=1,  num_workers=1)
-
-    print('dry test')
-    for batch in test_data_loader:
-        vid, mels, lastframe = batch
-        lastframe = lastframe.item()  # single elt in batch
-        print('lastframe ', lastframe)
+    train_data_loader = data_utils.DataLoader(train_dataset, batch_size=1,  num_workers=2, shuffle=True)
+    val_data_loader = data_utils.DataLoader(val_dataset, batch_size=1, num_workers=2)
 
     # Model
     print('build model')
     model = SyncTransformer().to(device)
-    print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
-
-    optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad],
-                           lr=5e-5)
+    params = set_parameters(model)
+    optimizer = optim.Adam(params, lr=1e-4)
 
     if checkpoint_path is not None:
         print('load checkpoint')
-        load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer=False, use_cuda=use_cuda)
+        load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer=True, use_cuda=use_cuda)
     else:
         global_step = 0
         global_epoch = 0
 
-    makeit(device, model, test_data_loader, optimizer, checkpoint_dir=checkpoint_dir,
+    trainit(device, model, train_data_loader, val_data_loader, optimizer, checkpoint_dir=checkpoint_dir,
           checkpoint_interval=10, nepochs=650)
