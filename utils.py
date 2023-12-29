@@ -33,7 +33,7 @@ def set_parameters(model):
     for p in model.parameters():
         p.requires_grad = False
     for p in model.mem_transformer.parameters():
-        p.requires_grad = True
+        p.requires_grad = False
     for p in model.fc.parameters():
         p.requires_grad = True
     for p in model.classifier.parameters():
